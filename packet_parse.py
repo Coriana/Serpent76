@@ -33,86 +33,56 @@ class Component:
                 f"ComponentSize={self.ComponentSize}, ComponentId={hex(self.ComponentId)}, "
                 f"componentBuffer={self.componentBuffer.hex()})")
 
-import io
 
 class ZeroRunLengthCompression:
-    def __init__(self, incoming_stream_or_maxsize):
-        self.zero_count = 0
-        self.compressed_size = 0
+    def __init__(self, input_stream: BytesIO):
+        self.input_stream = input_stream
 
-        if isinstance(incoming_stream_or_maxsize, io.BytesIO):
-            self.compressed_stream = incoming_stream_or_maxsize
-            self.maximum_size = 0xFFFF
-        else:
-            self.maximum_size = incoming_stream_or_maxsize
-            self.compressed_stream = io.BytesIO()
+    def decompress(self, expected_size: int) -> bytes:
+        """
+        Decompresses data using Zero Run-Length Compression (ZRL).
+        The ZRL scheme is assumed to work as follows:
+            - Read one byte at a time.
+            - If the byte is non-zero, append it to the output.
+            - If the byte is zero, the next byte specifies how many zeros to append.
 
-    def dispose(self):
-        if self.compressed_stream:
-            self.compressed_stream.close()
+        Args:
+            expected_size (int): The number of uncompressed bytes expected.
 
-    def read_bytes(self, length):
+        Returns:
+            bytes: The decompressed data.
+        """
         output = bytearray()
-        for _ in range(length):
-            output.append(self.read_byte())
-        return bytes(output)
+        decompressed_bytes = 0
+        while decompressed_bytes < expected_size:
+            flag_byte = self.input_stream.read(1)
+            if not flag_byte:
+                # End of stream reached unexpectedly
+                logger.error(f"ZRL Decompression: Unexpected end of stream. Expected {expected_size} bytes, got {decompressed_bytes} bytes.")
+                break
 
-    def write_bytes(self, data):
-        for value in data:
-            self.write_byte(value)
+            if flag_byte != b'\x00':
+                # Non-zero byte, append directly
+                output.append(flag_byte[0])
+                decompressed_bytes += 1
+                logger.debug(f"ZRL: Appended byte 0x{flag_byte[0]:02X}, Total: {decompressed_bytes}/{expected_size}")
+            else:
+                # Zero byte, next byte specifies run length
+                run_length_byte = self.input_stream.read(1)
+                if not run_length_byte:
+                    logger.error("ZRL Decompression: Unexpected end of stream after zero flag.")
+                    break
+                run_length = run_length_byte[0]
+                output.extend(b'\x00' * run_length)
+                decompressed_bytes += run_length
+                logger.debug(f"ZRL: Appended {run_length} zeros, Total: {decompressed_bytes}/{expected_size}")
 
-    def end(self):
-        self.write_run_length()
-        if self.maximum_size == -1:
-            return -1
-        return self.compressed_size
+        if decompressed_bytes < expected_size:
+            logger.warning(f"ZRL Decompression: Expected {expected_size} bytes, but only {decompressed_bytes} bytes were decompressed.")
 
-    def write_run_length(self):
-        if self.zero_count > 0:
-            if self.compressed_size + 2 > self.maximum_size:
-                self.maximum_size = -1
-                return False
-
-            self.compressed_stream.write(bytes([0, self.zero_count]))
-            self.compressed_size += 2
-            self.zero_count = 0
-        return True
-
-    def write_byte(self, value):
-        if value != 0 or self.zero_count >= 255:
-            if not self.write_run_length():
-                self.maximum_size = -1
-                return False
-
-        if value != 0:
-            if self.compressed_size + 1 > self.maximum_size:
-                self.maximum_size = -1
-                return False
-
-            self.compressed_stream.write(bytes([value]))
-            self.compressed_size += 1
-        else:
-            self.zero_count += 1
-
-        return True
-
-    def read_byte(self):
-        if self.zero_count == 0:
-            value = self.read_internal()
-            if value != 0:
-                return value
-            self.zero_count = self.read_internal()
-
-        self.zero_count -= 1
-        return 0
-
-    def read_internal(self):
-        self.compressed_size += 1
-        value = self.compressed_stream.read(1)
-        if not value:
-            raise EOFError("Unexpected end of stream")
-        return value[0]
-
+        # Truncate to expected size in case of over-decompression
+        return bytes(output[:expected_size])
+    
 class Snapshot:
     def __init__(self, data: bytes):
         self.Components: List[Component] = []
@@ -209,7 +179,7 @@ class Snapshot:
                     # Initialize ZRL decompressor
                     zrl = ZeroRunLengthCompression(reader)
                     logger.debug("Using Zero Run-Length Compression for component data.")
-                    component_buffer = zrl.read_bytes(component_size)
+                    component_buffer = zrl.decompress(component_size)
                     actual_size = len(component_buffer)
                     logger.debug(f"Decompressed Component Buffer Length: {actual_size} bytes")
                     if actual_size < component_size:
