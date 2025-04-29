@@ -32,54 +32,85 @@ class Component:
                 f"ComponentSize={self.ComponentSize}, ComponentId={self.ComponentId}, "
                 f"componentBuffer={self.componentBuffer.hex()})")
 
+import io
+
 class ZeroRunLengthCompression:
-    def __init__(self, input_stream: BytesIO):
-        self.input_stream = input_stream
+    def __init__(self, incoming_stream_or_maxsize):
+        self.zero_count = 0
+        self.compressed_size = 0
 
-    def decompress(self, expected_size: int) -> bytes:
-        """
-        Decompresses data using Zero Run-Length Compression (ZRL).
-        The ZRL scheme is assumed to work as follows:
-            - Read one byte at a time.
-            - If the byte is non-zero, append it to the output.
-            - If the byte is zero, the next byte specifies how many zeros to append.
+        if isinstance(incoming_stream_or_maxsize, io.BytesIO):
+            self.compressed_stream = incoming_stream_or_maxsize
+            self.maximum_size = 0xFFFF
+        else:
+            self.maximum_size = incoming_stream_or_maxsize
+            self.compressed_stream = io.BytesIO()
 
-        Args:
-            expected_size (int): The number of uncompressed bytes expected.
+    def dispose(self):
+        if self.compressed_stream:
+            self.compressed_stream.close()
 
-        Returns:
-            bytes: The decompressed data.
-        """
+    def read_bytes(self, length):
         output = bytearray()
-        decompressed_bytes = 0
-        while decompressed_bytes < expected_size:
-            flag_byte = self.input_stream.read(1)
-            if not flag_byte:
-                # End of stream reached unexpectedly
-                logger.error(f"ZRL Decompression: Unexpected end of stream. Expected {expected_size} bytes, got {decompressed_bytes} bytes.")
-                break
+        for _ in range(length):
+            output.append(self.read_byte())
+        return bytes(output)
 
-            if flag_byte != b'\x00':
-                # Non-zero byte, append directly
-                output.append(flag_byte[0])
-                decompressed_bytes += 1
-                logger.debug(f"ZRL: Appended byte 0x{flag_byte[0]:02X}, Total: {decompressed_bytes}/{expected_size}")
-            else:
-                # Zero byte, next byte specifies run length
-                run_length_byte = self.input_stream.read(1)
-                if not run_length_byte:
-                    logger.error("ZRL Decompression: Unexpected end of stream after zero flag.")
-                    break
-                run_length = run_length_byte[0]
-                output.extend(b'\x00' * run_length)
-                decompressed_bytes += run_length
-                logger.debug(f"ZRL: Appended {run_length} zeros, Total: {decompressed_bytes}/{expected_size}")
+    def write_bytes(self, data):
+        for value in data:
+            self.write_byte(value)
 
-        if decompressed_bytes < expected_size:
-            logger.warning(f"ZRL Decompression: Expected {expected_size} bytes, but only {decompressed_bytes} bytes were decompressed.")
+    def end(self):
+        self.write_run_length()
+        if self.maximum_size == -1:
+            return -1
+        return self.compressed_size
 
-        # Truncate to expected size in case of over-decompression
-        return bytes(output[:expected_size])
+    def write_run_length(self):
+        if self.zero_count > 0:
+            if self.compressed_size + 2 > self.maximum_size:
+                self.maximum_size = -1
+                return False
+
+            self.compressed_stream.write(bytes([0, self.zero_count]))
+            self.compressed_size += 2
+            self.zero_count = 0
+        return True
+
+    def write_byte(self, value):
+        if value != 0 or self.zero_count >= 255:
+            if not self.write_run_length():
+                self.maximum_size = -1
+                return False
+
+        if value != 0:
+            if self.compressed_size + 1 > self.maximum_size:
+                self.maximum_size = -1
+                return False
+
+            self.compressed_stream.write(bytes([value]))
+            self.compressed_size += 1
+        else:
+            self.zero_count += 1
+
+        return True
+
+    def read_byte(self):
+        if self.zero_count == 0:
+            value = self.read_internal()
+            if value != 0:
+                return value
+            self.zero_count = self.read_internal()
+
+        self.zero_count -= 1
+        return 0
+
+    def read_internal(self):
+        self.compressed_size += 1
+        value = self.compressed_stream.read(1)
+        if not value:
+            raise EOFError("Unexpected end of stream")
+        return value[0]
 
 class Snapshot:
     def __init__(self, data: bytes):
@@ -106,31 +137,28 @@ class Snapshot:
                 return None
             header_byte = header_byte_data[0]
             logger.debug(f"Header Byte: 0x{header_byte:02X}")
-
             # Extract fields from header_byte
             action = (header_byte >> 6) & 0x03  # bits 7..6
             entity_id_length = ((header_byte >> 4) & 0x03) + 1  # bits 5..4 + 1
-            use_zero_run_length = ((header_byte & 0x01) == 0)  # bit 0
+            IsUncompressed = ((header_byte & 0x01) != 0)  # bit 0
             is_large_component_id = ((header_byte & 0x08) != 0)  # bit 3
 
             logger.debug(f"Action: {action}, EntityID Length: {entity_id_length}, "
-                         f"Use ZRL: {use_zero_run_length}, Is Large Component ID: {is_large_component_id}")
+                         f"IsUncompressed: {IsUncompressed}, Is Large Component ID: {is_large_component_id}")
 
-            # Determine lengths based on action
-            if action != 3:  # If not DeleteEntity
-                component_id_length = 2 if is_large_component_id else 1
-            else:
-                component_id_length = 0
 
             if action == 0:  # UpdateFromDefault
+                component_id_length = 2 if is_large_component_id else 1
                 resource_id_length = ((header_byte >> 1) & 0x03) + 1  # bits 2..1 +1
                 component_size_length = 1
             elif action == 1:  # UpdateFromPrevious
                 resource_id_length = 0
-                component_size_length = 1
+                component_size_length = 0
+                component_id_length = 0
             elif action == 2:  # DeleteComponent
                 resource_id_length = 0
                 component_size_length = 0
+                component_id_length = 2 if is_large_component_id else 1
             elif action == 3:  # DeleteEntity
                 resource_id_length = 0
                 component_size_length = 0
@@ -162,15 +190,15 @@ class Snapshot:
 
             logger.debug(f"Parsed Fields -> EntityID: {entity_id}, ComponentID: {component_id}, "
                          f"ResourceID: {resource_id}, ComponentSize: {component_size}")
-
+            
             # Read component data
             component_buffer = b''
             if component_size > 0:
-                if use_zero_run_length:
+                if not IsUncompressed:
                     # Initialize ZRL decompressor
                     zrl = ZeroRunLengthCompression(reader)
                     logger.debug("Using Zero Run-Length Compression for component data.")
-                    component_buffer = zrl.decompress(component_size)
+                    component_buffer = zrl.read_bytes(component_size)
                     actual_size = len(component_buffer)
                     logger.debug(f"Decompressed Component Buffer Length: {actual_size} bytes")
                     if actual_size < component_size:
@@ -312,7 +340,7 @@ def parse_packet_main(packet_data, direction):
                 current_pos += unseq_rmsg_size_real
 
         # Continue parsing fixed-size fields
-        fixed_format = '<IIIIIIHI'  # Adjust format as per actual structure
+        fixed_format = '<iIiiiiHI'  # Adjust format as per actual structure
         fixed_size = struct.calcsize(fixed_format)
         if len(packet_data) < current_pos + fixed_size:
             logger.error(f"Packet data too short for fixed-size fields. Expected additional {fixed_size} bytes.")
@@ -322,18 +350,23 @@ def parse_packet_main(packet_data, direction):
             ack_bits,
             delta,
             base,
-            compressed_body,
+            compressed_body_check,
             uncompressed_body,
             component_count,
             timestamp
         ) = struct.unpack_from(fixed_format, packet_data, current_pos)
         current_pos += fixed_size
-
+        # seq.CompressedBodyMessageSizePreCompressionCheck = reader.ReadInt32();
+        # seq.IsBodyCompressed = seq.CompressedBodyMessageSizePreCompressionCheck < 0;
+        # seq.CompressedBodyMessageSize = (uint)(seq.CompressedBodyMessageSizePreCompressionCheck & 0x7FFFFFFF);
+        print(f"Compressed Body Check: {compressed_body_check}")
+        compressed_body = 0
+        if compressed_body_check < 0:
+            IsBodyCompressed = True
+            compressed_body = compressed_body_check & 0x7FFFFFFF
         # Extract component_data
-        if len(packet_data) < current_pos + compressed_body:
-            logger.error(f"Packet data too short for component_data. Expected {compressed_body} bytes, got {len(packet_data) - current_pos} bytes.")
+        if uncompressed_body > 0:
             component_data = packet_data[current_pos:]
-            logger.warning(f"Using available {len(component_data)} bytes for component_data.")
         else:
             component_data = packet_data[current_pos:current_pos + compressed_body]
 
@@ -362,6 +395,7 @@ def parse_packet_main(packet_data, direction):
         logger.debug(f"  Ack Bits: {ack_bits_bin}")
         logger.debug(f"  Delta: {delta}")
         logger.debug(f"  Base: {base}")
+        logger.debug(f"  Compressed Body: {compressed_body}")
         logger.debug(f"  Uncompressed Body: {uncompressed_body}")
         logger.debug(f"  Component Count: {component_count}")
         logger.debug(f"  Timestamp: {timestamp}")
@@ -641,7 +675,8 @@ def main():
                     component_count = complete_packet_output.get('component_count')
                     if component_data:
                         try:
-                            snapshot = Snapshot(component_data)
+                            lzw_decompressed = lzw_decompress(component_data)
+                            snapshot = Snapshot(lzw_decompressed)
                             for component in snapshot.Components:
                                 logger.info(str(component))
                                 # Further processing of components
