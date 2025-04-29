@@ -8,14 +8,15 @@ from typing import List, Optional
 
 # Configure logging
 logging.basicConfig(
-    level=logging.DEBUG,  # Set to DEBUG to capture all logs
+    level=logging.INFO,  # Set to DEBUG to capture all logs
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
 
 class Component:
-    def __init__(self, entity_id: int, resource_id: int, component_size: int,
+    def __init__(self, header: List, entity_id: int, resource_id: int, component_size: int,
                  component_id: int, component_buffer: bytes):
+        self.Header = header
         self.EntityId = entity_id
         self.ResourceId = resource_id
         self.ComponentSize = component_size
@@ -23,13 +24,13 @@ class Component:
         self.componentBuffer = component_buffer
 
     @classmethod
-    def GetComponent(cls, entity_id: int, resource_id: int, component_size: int,
+    def GetComponent(cls, header: List, entity_id: int, resource_id: int, component_size: int,
                     component_id: int, component_buffer: bytes) -> 'Component':
-        return cls(entity_id, resource_id, component_size, component_id, component_buffer)
+        return cls(header, entity_id, resource_id, component_size, component_id, component_buffer)
 
     def __str__(self):
-        return (f"Component(EntityId={self.EntityId}, ResourceId={self.ResourceId}, "
-                f"ComponentSize={self.ComponentSize}, ComponentId={self.ComponentId}, "
+        return (f"Component(Header={self.Header}, EntityId={hex(self.EntityId)}, ResourceId={hex(self.ResourceId)}, "
+                f"ComponentSize={self.ComponentSize}, ComponentId={hex(self.ComponentId)}, "
                 f"componentBuffer={self.componentBuffer.hex()})")
 
 import io
@@ -138,6 +139,9 @@ class Snapshot:
             header_byte = header_byte_data[0]
             logger.debug(f"Header Byte: 0x{header_byte:02X}")
             # Extract fields from header_byte
+            component_id_length = 0
+            resource_id_length = 0
+            component_size_length = 0
             action = (header_byte >> 6) & 0x03  # bits 7..6
             entity_id_length = ((header_byte >> 4) & 0x03) + 1  # bits 5..4 + 1
             IsUncompressed = ((header_byte & 0x01) != 0)  # bit 0
@@ -152,16 +156,13 @@ class Snapshot:
                 resource_id_length = ((header_byte >> 1) & 0x03) + 1  # bits 2..1 +1
                 component_size_length = 1
             elif action == 1:  # UpdateFromPrevious
-                resource_id_length = 0
-                component_size_length = 0
-                component_id_length = 0
+                pass
             elif action == 2:  # DeleteComponent
                 resource_id_length = 0
                 component_size_length = 0
                 component_id_length = 2 if is_large_component_id else 1
             elif action == 3:  # DeleteEntity
-                resource_id_length = 0
-                component_size_length = 0
+                pass
             else:
                 logger.error(f"Unknown action type: {action}")
                 return None
@@ -169,6 +170,16 @@ class Snapshot:
             logger.debug(f"ComponentID Length: {component_id_length}, "
                          f"ResourceID Length: {resource_id_length}, "
                          f"ComponentSize Length: {component_size_length}")
+            # store header data for debugging
+            header_data = {
+                'action': action,
+                'entity_id_length': entity_id_length,
+                'is_uncompressed': IsUncompressed,
+                'is_large_component_id': is_large_component_id,
+                'component_id_length': component_id_length,
+                'resource_id_length': resource_id_length,
+                'component_size_length': component_size_length
+            }
 
             # Helper function to read little-endian unsigned int
             def read_little_uint(length: int) -> int:
@@ -216,6 +227,7 @@ class Snapshot:
             logger.debug(f"Component Buffer Data: {component_buffer.hex()}")
 
             return Component.GetComponent(
+                header=header_data,
                 entity_id=entity_id,
                 resource_id=resource_id,
                 component_size=component_size,
@@ -673,16 +685,18 @@ def main():
                     # Decompress component_data if it exists
                     component_data = complete_packet_output.get('component_data')
                     component_count = complete_packet_output.get('component_count')
-                    if component_data:
-                        try:
-                            lzw_decompressed = lzw_decompress(component_data)
-                            snapshot = Snapshot(lzw_decompressed)
-                            for component in snapshot.Components:
-                                logger.info(str(component))
-                                # Further processing of components
-                        except Exception as e:
-                            logger.error(f"Error processing components for {packet_key}: {e}")
-                            continue
+                    if component_count:
+                        # go through each component
+                        for i in range(component_count):
+                            try:
+                                lzw_decompressed = lzw_decompress(component_data)
+                                snapshot = Snapshot(lzw_decompressed)
+                                for component in snapshot.Components:
+                                    logger.info(str(component))
+                                    # Further processing of components
+                            except Exception as e:
+                                logger.error(f"Error processing components for {packet_key}: {e}")
+                                continue
 
                     # Store in delta_check
                     delta_check_key = (packet_key[2], complete_packet_output['delta'])
