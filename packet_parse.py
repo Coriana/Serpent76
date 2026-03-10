@@ -1,6 +1,7 @@
 import json
 from datetime import datetime
 from collections import defaultdict
+from sqlite3.dbapi2 import Timestamp
 import struct
 import logging
 from io import BytesIO
@@ -38,6 +39,7 @@ class Component:
         return (f"Component(Header={self.Header}, EntityId={hex(self.EntityId)}, ResourceId={hex(self.ResourceId)}, "
                 f"ComponentSize={self.ComponentSize}, ComponentId={hex(self.ComponentId)}, "
                 f"componentBuffer={self.componentBuffer.hex()})")
+
 
 class ZeroRunLengthCompression:
     def __init__(self, incoming_stream_or_maxsize):
@@ -117,6 +119,361 @@ class ZeroRunLengthCompression:
             raise EOFError("Unexpected end of stream")
         return value[0]
 
+class LZWCompressionData:
+    LZW_DICT_BITS = 12
+    LZW_DICT_SIZE = 1 << LZW_DICT_BITS
+
+    def __init__(self):
+        self.dictionary_k = bytearray(self.LZW_DICT_SIZE)
+        self.dictionary_w = [0] * self.LZW_DICT_SIZE
+        self.next_code = 0
+        self.code_bits = 0
+        self.code_word = 0
+        self.temp_value = 0
+        self.temp_bits = 0
+        self.bytes_written = 0
+
+
+class LightweightCompression:
+    LZW_BLOCK_SIZE = 1 << 15
+    LZW_START_BITS = 9
+    LZW_FIRST_CODE = 1 << (LZW_START_BITS - 1)
+    DICTIONARY_HASH_BITS = 10
+    MAX_DICTIONARY_HASH = 1 << DICTIONARY_HASH_BITS
+    HASH_MASK = MAX_DICTIONARY_HASH - 1
+
+    def __init__(self):
+        self._lzw_data = LZWCompressionData()
+        self._hash = [0] * self.MAX_DICTIONARY_HASH
+        self._next_hash = [0] * LZWCompressionData.LZW_DICT_SIZE
+        self.overflowed = False
+        self._block = bytearray(self.LZW_BLOCK_SIZE)
+        self._data = None
+        self._block_size = 0
+        self._block_index = 0
+        self.bytes_read = 0
+        self._max_size = 0
+        self._old_code = 0
+        self.total_bytes_read = 0
+        self.total_bits_read = 0
+
+    @property
+    def length(self):
+        return self._lzw_data.bytes_written
+
+    def start(self, source_array_or_size, maximum_size_or_append, append=None):
+        if isinstance(source_array_or_size, (bytes, bytearray)):
+            source_array = source_array_or_size
+            maximum_size = maximum_size_or_append
+            # Start(byte[], int, bool)
+            self._clear_hash()
+
+            if append:
+                original_next_code = self._lzw_data.next_code
+                self._lzw_data.next_code = self.LZW_FIRST_CODE
+                for i in range(self.LZW_FIRST_CODE, original_next_code):
+                    self._add_to_dictionary(self._lzw_data.dictionary_w[i], self._lzw_data.dictionary_k[i])
+            else:
+                for i in range(self.LZW_FIRST_CODE):
+                    self._lzw_data.dictionary_k[i] = i & 0xFF
+                    self._lzw_data.dictionary_w[i] = 0xFFFF
+
+                self._lzw_data.next_code = self.LZW_FIRST_CODE
+                self._lzw_data.code_bits = self.LZW_START_BITS
+                self._lzw_data.code_word = -1
+                self._lzw_data.temp_value = 0
+                self._lzw_data.temp_bits = 0
+                self._lzw_data.bytes_written = 0
+
+            self._old_code = -1
+            self._data = bytearray(source_array) if not isinstance(source_array, bytearray) else source_array
+            self._block_size = 0
+            self._block_index = 0
+            self.bytes_read = 0
+            self.total_bytes_read = 0
+            self.total_bits_read = 0
+            self._max_size = maximum_size
+            self.overflowed = False
+        else:
+            # Start(int, bool)
+            maximum_size = source_array_or_size
+            append_flag = maximum_size_or_append
+
+            self._clear_hash()
+
+            if append_flag:
+                original_next_code = self._lzw_data.next_code
+                self._lzw_data.next_code = self.LZW_FIRST_CODE
+                for i in range(self.LZW_FIRST_CODE, original_next_code):
+                    self._add_to_dictionary(self._lzw_data.dictionary_w[i], self._lzw_data.dictionary_k[i])
+            else:
+                for i in range(self.LZW_FIRST_CODE):
+                    self._lzw_data.dictionary_k[i] = i & 0xFF
+                    self._lzw_data.dictionary_w[i] = 0xFFFF
+
+                self._lzw_data.next_code = self.LZW_FIRST_CODE
+                self._lzw_data.code_bits = self.LZW_START_BITS
+                self._lzw_data.code_word = -1
+                self._lzw_data.temp_value = 0
+                self._lzw_data.temp_bits = 0
+                self._lzw_data.bytes_written = 0
+
+            self._old_code = -1
+            self._block_size = 0
+            self._block_index = 0
+            self._data = bytearray(maximum_size)
+            self.bytes_read = 0
+            self.total_bytes_read = 0
+            self.total_bits_read = 0
+            self._max_size = maximum_size
+            self.overflowed = False
+
+    def read_bytes(self, buffer, length, ignore_overflow=False):
+        for i in range(length):
+            b = self._read_byte(ignore_overflow)
+            if b == -1:
+                buffer[i] = 0
+                return i
+            buffer[i] = b & 0xFF
+        return length
+
+    def read_byte_out(self):
+        b = self._read_byte(False)
+        if b == -1:
+            return False, 0
+        return True, b & 0xFF
+
+    def read_to_end(self, buffer):
+        result = bytearray()
+        while True:
+            b = self._read_byte(False)
+            if b == -1:
+                break
+            result.append(b & 0xFF)
+
+        for i in range(min(len(result), len(buffer))):
+            buffer[i] = result[i]
+        return len(result)
+
+    def _read_byte(self, ignore_overflow=False):
+        if self._block_index == self._block_size:
+            self._decompress_block()
+
+        if self._block_index == self._block_size:
+            if not ignore_overflow:
+                self.overflowed = True
+            return -1
+
+        self.total_bytes_read += 1
+        self.total_bits_read += 8
+        value = self._block[self._block_index]
+        self._block_index += 1
+        return value
+    
+    def read_bytes_out(self, length):
+        """Read N decompressed bytes and return them as a bytes object."""
+        buf = bytearray(length)
+        count = self.read_bytes(buf, length)
+        return bytes(buf[:count])
+
+    def read_dynamic_uint_terminated(self):
+        """Read a 7-bit encoded uint (variable-length, LEB128-style) from the LZW stream."""
+        result = 0
+        shift = 0
+        while True:
+            b = self._read_byte()
+            if b == -1:
+                break
+            result |= (b & 0x7F) << shift
+            shift += 7
+            if (b & 0x80) == 0:
+                break
+        return result & 0xFFFFFFFF
+
+    def read_dynamic_ushort_terminated(self):
+        """Read a 7-bit encoded ushort from the LZW stream."""
+        return self.read_dynamic_uint_terminated() & 0xFFFF
+    
+    def read_single_byte(self):
+        buf = bytearray(1)
+        if self.read_bytes(buf, 1) > 0:
+            return buf[0]
+        return 0
+
+    def write_byte(self, value):
+        code = self._lookup(self._lzw_data.code_word, value)
+        if code >= 0:
+            self._lzw_data.code_word = code
+        else:
+            self._write_bits(self._lzw_data.code_word & 0xFFFFFFFF, self._lzw_data.code_bits)
+            if not self._bump_bits():
+                self._add_to_dictionary(self._lzw_data.code_word, value)
+            self._lzw_data.code_word = value
+
+        if self._lzw_data.bytes_written >= self._max_size - (self._lzw_data.code_bits + self._lzw_data.temp_bits + 7) // 8:
+            self.overflowed = True
+
+    def write7_bit_encoded_uint(self, value):
+        if isinstance(value, int) and value <= 0xFFFF:
+            # ushort version
+            max_iter = 2
+        else:
+            max_iter = 4
+
+        count = 0
+        buffer = []
+        while value >= 0x80 and count < max_iter:
+            buffer.append((value & 0xFF) | 0x80)
+            value >>= 7
+            count += 1
+        buffer.append(value & 0xFF)
+
+        for b in buffer:
+            self.write_byte(b)
+
+    def _lookup(self, w, k):
+        if w == -1:
+            return k
+        i = self._hash_index(w, k)
+        j = self._hash[i]
+        while j != 0xFFFF and j != 0:
+            if self._lzw_data.dictionary_k[j] == k and self._lzw_data.dictionary_w[j] == w:
+                return j
+            j = self._next_hash[j]
+        return -1
+
+    def _read_bits(self, bits):
+        bits_to_read = bits - self._lzw_data.temp_bits
+        while bits_to_read > 0:
+            if self.bytes_read >= self._max_size:
+                return -1
+            self._lzw_data.temp_value |= self._data[self.bytes_read] << self._lzw_data.temp_bits
+            self.bytes_read += 1
+            self._lzw_data.temp_bits += 8
+            bits_to_read -= 8
+
+        value = self._lzw_data.temp_value & ((1 << bits) - 1)
+        self._lzw_data.temp_value >>= bits
+        self._lzw_data.temp_bits -= bits
+        return value
+
+    def _write_bits(self, value, bits):
+        self._lzw_data.temp_value |= value << self._lzw_data.temp_bits
+        self._lzw_data.temp_bits += bits
+
+        while self._lzw_data.temp_bits >= 8:
+            if self._lzw_data.bytes_written >= self._max_size:
+                self.overflowed = True
+                return
+            self._data[self._lzw_data.bytes_written] = self._lzw_data.temp_value & 0xFF
+            self._lzw_data.bytes_written += 1
+            self._lzw_data.temp_value >>= 8
+            self._lzw_data.temp_bits -= 8
+
+    def _write_chain(self, code):
+        chain = bytearray(LZWCompressionData.LZW_DICT_SIZE)
+        i = 0
+        while True:
+            chain[i] = self._lzw_data.dictionary_k[code]
+            i += 1
+            code = self._lzw_data.dictionary_w[code]
+            if code == 0xFFFF:
+                break
+
+        i -= 1
+        first_char = chain[i]
+        while i >= 0:
+            self._block[self._block_size] = chain[i]
+            self._block_size += 1
+            i -= 1
+        return first_char
+
+    def _add_to_dictionary(self, w, k):
+        self._lzw_data.dictionary_k[self._lzw_data.next_code] = k & 0xFF
+        self._lzw_data.dictionary_w[self._lzw_data.next_code] = w & 0xFFFF
+        i = self._hash_index(w, k)
+        self._next_hash[self._lzw_data.next_code] = self._hash[i]
+        self._hash[i] = self._lzw_data.next_code & 0xFFFF
+        result = self._lzw_data.next_code
+        self._lzw_data.next_code += 1
+        return result
+
+    def _hash_index(self, w, k):
+        return (w ^ k) & self.HASH_MASK
+
+    def _decompress_block(self):
+        self._block_index = 0
+        self._block_size = 0
+        first_char = -1
+
+        while self._block_size < self.LZW_BLOCK_SIZE - LZWCompressionData.LZW_DICT_SIZE:
+            code = self._read_bits(self._lzw_data.code_bits)
+            if code == -1:
+                break
+
+            if self._old_code == -1:
+                self._block[self._block_size] = code & 0xFF
+                self._block_size += 1
+                self._old_code = code
+                first_char = code
+                continue
+
+            if code >= self._lzw_data.next_code:
+                first_char = self._write_chain(self._old_code)
+                self._block[self._block_size] = first_char & 0xFF
+                self._block_size += 1
+            else:
+                first_char = self._write_chain(code)
+
+            self._add_to_dictionary(self._old_code, first_char)
+
+            if self._bump_bits():
+                self._old_code = -1
+            else:
+                self._old_code = code
+
+    def _bump_bits(self):
+        bumped = False
+        if self._lzw_data.next_code == (1 << self._lzw_data.code_bits):
+            self._lzw_data.code_bits += 1
+            if self._lzw_data.code_bits > LZWCompressionData.LZW_DICT_BITS:
+                self._lzw_data.next_code = self.LZW_FIRST_CODE
+                self._lzw_data.code_bits = self.LZW_START_BITS
+                self._clear_hash()
+                bumped = True
+        return bumped
+
+    def end(self):
+        if self._lzw_data.code_word != -1:
+            self._write_bits(self._lzw_data.code_word & 0xFFFFFFFF, self._lzw_data.code_bits)
+
+        if self._lzw_data.temp_bits > 0:
+            if self._lzw_data.bytes_written >= self._max_size:
+                self.overflowed = True
+                return -1
+            self._data[self._lzw_data.bytes_written] = self._lzw_data.temp_value & ((1 << self._lzw_data.temp_bits) - 1)
+            self._lzw_data.bytes_written += 1
+
+        return self.length if self.length > 0 else -1
+
+    def _clear_hash(self):
+        self._hash = [0xFF] * self.MAX_DICTIONARY_HASH
+
+    def get_data(self):
+        return bytes(self._data[:self._lzw_data.bytes_written])
+
+    def write_bytes(self, data):
+        for b in data:
+            self.write_byte(b)
+
+    @staticmethod
+    def compress(component_bytes):
+        lwc = LightweightCompression()
+        lwc.start(0x7FFF, False)
+        lwc.write_bytes(component_bytes)
+        lwc.end()
+        return lwc.get_data()
+    
 class Snapshot:
     def __init__(self, data: bytes, component_count: int = 0):
         self.ComponentCount = component_count
@@ -257,7 +614,7 @@ def parse_packet_udp(log_entry):
         direction = 'in_' if direction == 'net.packet.recv' else 'out'
         packet_hex = entry_data['data']['packet']
 
-        packet_data = bytes.fromhex(packet_hex)
+        packet_data = bytes.fromhex(packet_hex.replace(' ', '')) 
         client_id = packet_data[:2]
         packet_type = packet_data[2]
         
@@ -312,6 +669,68 @@ def parse_packet_ping(packet_data):
         }
     except (IndexError, ValueError) as e:
         logger.error(f"Failed to parse ping packet: {e} | Data: {packet_data.hex()}")
+        return None
+# global channel list & data tuple for rmsg parsing (0 - 9)
+channel_data = {i: None for i in range(10)}
+    
+def parse_rmsg(rmsg_data, count):
+    try:
+        # store the messages to come out
+        rmsgs = []
+        current_pos = 0
+        lzw_compression = LightweightCompression()
+        lzw_compression.start(rmsg_data, len(rmsg_data), False)
+
+        for i in range(count):
+            channel = lzw_compression.read_single_byte()
+            logger.debug(f"Current Channel: {channel}")
+            # check if the channel is open and being used, if not initialize it with the data tuple.
+            if channel < 10:
+                if channel_data[channel] is None:
+                    # total message size (4 bytes with the 8th bit terminating the size), game message type (2 bytes with the 8th bit terminating the size), message flags (1 byte) GameMessageBlockSize (4 bytes with the 8th bit terminating the size)))
+                    total_size = lzw_compression.read_dynamic_uint_terminated()
+
+                    game_message_type = lzw_compression.read_dynamic_ushort_terminated()
+                    if game_message_type > 0:
+                        game_message_type -= 1  # adjust for 0-based indexing
+                    message_flags = lzw_compression.read_single_byte()
+                    game_message_block_size = lzw_compression.read_dynamic_uint_terminated()
+                    message_block_data = bytearray(game_message_block_size)
+                    read_bytes = lzw_compression.read_bytes_out(game_message_block_size)
+
+                    # if total message size is greater than the game message block size, then we need to wait for the next packet to get the rest of the data, so we will store the data tuple in the channel_data list at the index of the channel, if it is not then we can just store the data tuple in the channel_data list at the index of the channel.
+                    # store the data tuple in the channel_data list at the index of the channel.
+                    if total_size > game_message_block_size:
+                        channel_data[channel] = (total_size, game_message_type, message_flags, game_message_block_size, read_bytes)
+                    else:
+                        rmsgs.append((game_message_type, message_flags, read_bytes))
+                        logger.debug(f"Parsed Rmsg - Channel: {channel}, Type: {game_message_type}, Flags: {message_flags}, Data: {read_bytes.hex()}")
+                # if the channel is already open and being used, check if the total message size is greater than the game message block size, if it is then append the data to the existing data tuple in the channel_data list at the index of the channel, if it is not then replace the existing data tuple in the channel_data list at the index of the channel with the new data tuple.
+                else:
+                    # game_message_block_size
+                    game_message_block_size = lzw_compression.read_dynamic_uint_terminated()
+                    message_block_data = bytearray(game_message_block_size)
+                    read_bytes = lzw_compression.read_bytes_out(game_message_block_size)
+                    # append the data to the existing data tuple in the channel_data list at the index of the channel.
+                    current_data_tuple = channel_data[channel]
+                    total_size = current_data_tuple[0]
+                    game_message_type = current_data_tuple[1]
+                    message_flags = current_data_tuple[2]
+                    existing_game_message_data = current_data_tuple[4]
+                    game_message_data = existing_game_message_data + read_bytes
+                    if total_size > game_message_block_size:
+                        game_message_data += read_bytes
+                        channel_data[channel] = (total_size, game_message_type, message_flags, game_message_block_size + len(game_message_data), game_message_data)
+                    else:
+                        # clear the channel data since we have received the full message and store the data tuple in the channel_data list at the index of the channel.
+                        channel_data[channel] = None
+                        rmsgs.append((game_message_type, message_flags, game_message_data.hex()))
+                        logger.debug(f"Parsed Rmsg - Channel: {channel}, Type: {game_message_type}, Flags: {message_flags}, Data: {game_message_data.hex()}")
+        return {
+            'rmsgs': rmsgs
+        }
+    except (IndexError, ValueError) as e:
+        logger.error(f"Failed to parse rmsg packet: {e} | Data: {rmsg_data.hex()}")
         return None
 
 def parse_packet_main(packet_data, direction):
@@ -381,7 +800,7 @@ def parse_packet_main(packet_data, direction):
         # seq.CompressedBodyMessageSizePreCompressionCheck = reader.ReadInt32();
         # seq.IsBodyCompressed = seq.CompressedBodyMessageSizePreCompressionCheck < 0;
         # seq.CompressedBodyMessageSize = (uint)(seq.CompressedBodyMessageSizePreCompressionCheck & 0x7FFFFFFF);
-        print(f"Compressed Body Check: {compressed_body_check}")
+        logger.debug(f"Compressed Body Check: {compressed_body_check}")
         compressed_body = 0
         if compressed_body_check < 0:
             IsBodyCompressed = True
@@ -430,8 +849,9 @@ def parse_packet_main(packet_data, direction):
             'incoming_seq': rmsg_incoming_seq,
             'rmsg_size_real': rmsg_size_real,
             'count': rmsg_count,
-            'unseq_rmsg_size_real': unseq_rmsg_size_real,
+            'rmsg_data': rmsg_data,
             'unseq_rmsg_count': unseq_rmsg_count,
+            'unseq_rmsg_data': unseq_rmsg_data,
             'last_ack': last_ack,
             'ack_bits': ack_bits_bin,        
             'delta': delta,
@@ -471,14 +891,15 @@ def lzw_decompress(compressed_data):
     
     # Convert compressed_data to a list for efficient popping
     compressed = list(compressed_data)
+    pos = 0
     
     def get_code():
-        nonlocal bits, bit_buffer, compressed, code_size
+        nonlocal bits, bit_buffer, pos, code_size
         while bits < code_size:
-            if len(compressed) == 0:
+            if pos >= len(compressed_data):
                 break
-            byte = compressed.pop(0)
-            bit_buffer |= byte << bits
+            bit_buffer |= compressed_data[pos] << bits
+            pos += 1
             bits += 8
         if bits >= code_size:
             code = bit_buffer & ((1 << code_size) - 1)
@@ -661,7 +1082,7 @@ def test_snapshot_parsing():
     assert component.ComponentSize == 3, f"Expected ComponentSize=3, got {component.ComponentSize}"
     assert component.componentBuffer == b'\xAA\xBB\xCC', f"Expected componentBuffer=b'\\xAA\\xBB\\xCC', got {component.componentBuffer}"
 
-    print("Test passed: Snapshot parsed correctly.")
+    logger.debug("Test passed: Snapshot parsed correctly.")
 
 def main():
     file_path = "Client_PLg.0.log"
@@ -692,6 +1113,25 @@ def main():
                     if not complete_packet_output:
                         logger.error(f"Failed to parse main packet {packet_key}. Skipping.")
                         continue
+                    
+                    # rmsg_data and unseq_rmsg_data parsing
+                    rmsg_data = complete_packet_output.get('rmsg_data') 
+                    rmsg_count = complete_packet_output.get('count', 0)
+                    if rmsg_data:
+                        rmsg_info = parse_rmsg(rmsg_data, rmsg_count)
+                        if rmsg_info:
+                            logger.debug(f"Parsed Rmsg Data: {rmsg_info}")
+                        else:
+                            logger.error(f"Failed to parse Rmsg data for {packet_key}")
+                    unseq_rmsg_data = complete_packet_output.get('unseq_rmsg_data')
+                    if unseq_rmsg_data:
+                        unseq_rmsg_data_count = complete_packet_output.get('unseq_rmsg_count', 0)   
+                        unseq_rmsg_info = parse_rmsg(unseq_rmsg_data, unseq_rmsg_data_count)
+                        
+                        if unseq_rmsg_info:
+                            logger.debug(f"Parsed Unseq Rmsg Data: {unseq_rmsg_info}")
+                        else:
+                            logger.error(f"Failed to parse Unseq Rmsg data for {packet_key}")
 
                     # Decompress component_data if it exists
                     component_data = complete_packet_output.get('component_data')
@@ -715,7 +1155,7 @@ def main():
 
                     try:
                         acked_delta = delta_check.get((opposite_direction, complete_packet_output['last_ack']))
-                        if acked_delta is None:
+                        if acked_delta is None or acked_delta != 0:
                             logger.warning(f"Failed to find {opposite_direction} {complete_packet_output['last_ack']} in delta_check")
                             lower_val = upper_val = None
                         else:
